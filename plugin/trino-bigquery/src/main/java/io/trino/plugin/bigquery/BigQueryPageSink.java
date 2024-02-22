@@ -15,12 +15,16 @@ package io.trino.plugin.bigquery;
 
 import com.google.api.core.ApiFuture;
 import com.google.cloud.bigquery.storage.v1.AppendRowsResponse;
+import com.google.cloud.bigquery.storage.v1.BatchCommitWriteStreamsRequest;
+import com.google.cloud.bigquery.storage.v1.BatchCommitWriteStreamsResponse;
 import com.google.cloud.bigquery.storage.v1.BigQueryWriteClient;
 import com.google.cloud.bigquery.storage.v1.CreateWriteStreamRequest;
+import com.google.cloud.bigquery.storage.v1.Exceptions.AppendSerializationError;
 import com.google.cloud.bigquery.storage.v1.JsonStreamWriter;
 import com.google.cloud.bigquery.storage.v1.TableName;
 import com.google.cloud.bigquery.storage.v1.WriteStream;
 import com.google.common.collect.ImmutableList;
+import com.google.protobuf.Descriptors.DescriptorValidationException;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
 import io.trino.spi.Page;
@@ -31,12 +35,14 @@ import io.trino.spi.type.Type;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 
-import static com.google.cloud.bigquery.storage.v1.WriteStream.Type.COMMITTED;
+import static com.google.cloud.bigquery.storage.v1.WriteStream.Type.PENDING;
 import static com.google.common.base.Preconditions.checkArgument;
 import static io.trino.plugin.bigquery.BigQueryErrorCode.BIGQUERY_BAD_WRITE;
 import static io.trino.plugin.bigquery.BigQueryTypeUtils.readNativeValue;
@@ -49,10 +55,12 @@ public class BigQueryPageSink
 {
     private final BigQueryWriteClient client;
     private final WriteStream writeStream;
+    private final JsonStreamWriter streamWriter;
     private final List<String> columnNames;
     private final List<Type> columnTypes;
     private final ConnectorPageSinkId pageSinkId;
     private final Optional<String> pageSinkIdColumnName;
+    private final TableName tableName;
 
     public BigQueryPageSink(
             BigQueryWriteClient client,
@@ -73,16 +81,21 @@ public class BigQueryPageSink
         this.pageSinkIdColumnName = requireNonNull(pageSinkIdColumnName, "pageSinkIdColumnName is null");
         checkArgument(temporaryTableName.isPresent() == pageSinkIdColumnName.isPresent(),
                 "temporaryTableName.isPresent is not equal to pageSinkIdColumn.isPresent");
-        TableName tableName = temporaryTableName
+        tableName = temporaryTableName
                 .map(table -> TableName.of(remoteTableName.getProjectId(), remoteTableName.getDatasetName(), table))
                 .orElseGet(remoteTableName::toTableName);
-        // TODO: Consider using PENDING mode
-        WriteStream stream = WriteStream.newBuilder().setType(COMMITTED).build();
+
         CreateWriteStreamRequest createWriteStreamRequest = CreateWriteStreamRequest.newBuilder()
                 .setParent(tableName.toString())
-                .setWriteStream(stream)
+                .setWriteStream(WriteStream.newBuilder().setType(PENDING).build())
                 .build();
-        this.writeStream = client.createWriteStream(createWriteStreamRequest);
+        writeStream = client.createWriteStream(createWriteStreamRequest);
+        try {
+            streamWriter = JsonStreamWriter.newBuilder(writeStream.getName(), writeStream.getTableSchema(), client).build();
+        }
+        catch (DescriptorValidationException | IOException | InterruptedException e) {
+            throw new TrinoException(BIGQUERY_BAD_WRITE, "Failed to create stream writer", e);
+        }
     }
 
     @Override
@@ -98,27 +111,39 @@ public class BigQueryPageSink
             batch.put(row);
         }
 
-        insertWithCommitted(batch);
+        append(batch);
         return NOT_BLOCKED;
     }
 
-    private void insertWithCommitted(JSONArray batch)
+    private void append(JSONArray batch)
     {
-        try (JsonStreamWriter writer = JsonStreamWriter.newBuilder(writeStream.getName(), writeStream.getTableSchema(), client).build()) {
-            ApiFuture<AppendRowsResponse> future = writer.append(batch);
+        try {
+            ApiFuture<AppendRowsResponse> future = streamWriter.append(batch);
             AppendRowsResponse response = future.get(); // Throw error
             if (response.hasError()) {
                 throw new TrinoException(BIGQUERY_BAD_WRITE, format("Response has error: %s", response.getError().getMessage()));
             }
         }
-        catch (Exception e) {
-            throw new TrinoException(BIGQUERY_BAD_WRITE, "Failed to insert rows", e);
+        catch (IOException | DescriptorValidationException | ExecutionException | InterruptedException | AppendSerializationError e) {
+            throw new TrinoException(BIGQUERY_BAD_WRITE, "Failed to append stream writer", e);
         }
     }
 
     @Override
     public CompletableFuture<Collection<Slice>> finish()
     {
+        streamWriter.close();
+        client.finalizeWriteStream(streamWriter.getStreamName());
+
+        BatchCommitWriteStreamsRequest commitRequest = BatchCommitWriteStreamsRequest.newBuilder()
+                .setParent(tableName.toString())
+                .addWriteStreams(writeStream.getName())
+                .build();
+        BatchCommitWriteStreamsResponse response = client.batchCommitWriteStreams(commitRequest);
+        if (response.getStreamErrorsCount() > 0) {
+            throw new TrinoException(BIGQUERY_BAD_WRITE, "Response has error: " + response.getStreamErrorsList());
+        }
+
         client.close();
         Slice value = Slices.allocate(Long.BYTES);
         value.setLong(0, pageSinkId.getId());
