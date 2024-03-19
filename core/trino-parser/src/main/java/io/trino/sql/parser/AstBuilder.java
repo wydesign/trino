@@ -1373,6 +1373,14 @@ class AstBuilder
     }
 
     @Override
+    public Node visitBackQuotedIdentifier(SqlBaseParser.BackQuotedIdentifierContext context) {
+        String token = context.getText();
+        String identifier = token.substring(1, token.length() - 1);
+
+        return new Identifier(getLocation(context), identifier, false);
+    }
+
+    @Override
     public Node visitSubquery(SqlBaseParser.SubqueryContext context)
     {
         return new TableSubquery(getLocation(context), (Query) visit(context.queryNoWith()));

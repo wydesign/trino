@@ -213,16 +213,17 @@ public class SqlParser
             }
         }
 
-        @Override
-        public void exitBackQuotedIdentifier(SqlBaseParser.BackQuotedIdentifierContext context)
-        {
-            Token token = context.BACKQUOTED_IDENTIFIER().getSymbol();
-            throw new ParsingException(
-                    "backquoted identifiers are not supported; use double quotes to quote identifiers",
-                    null,
-                    token.getLine(),
-                    token.getCharPositionInLine() + 1);
-        }
+//        @Override
+//        public void exitBackQuotedIdentifier(SqlBaseParser.BackQuotedIdentifierContext context)
+//        {
+//            Token token = context.BACKQUOTED_IDENTIFIER().getSymbol();
+//            throw new ParsingException(
+//                    "backquoted identifiers are not supported; use double quotes to quote identifiers",
+//                    null,
+//                    token.getLine(),
+//                    token.getCharPositionInLine() + 1);
+//        }
+
 
         @Override
         public void exitDigitIdentifier(SqlBaseParser.DigitIdentifierContext context)
